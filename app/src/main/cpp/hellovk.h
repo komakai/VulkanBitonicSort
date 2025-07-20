@@ -155,6 +155,13 @@ static void DestroyDebugUtilsMessengerEXT(
 #define BUFFER_LENGTH (128 * 1024)
 #define BUFFER_SIZE (BUFFER_LENGTH * sizeof(int32_t))
 
+enum {
+    COMMAND_BUFFER_PUSH_DATA = 0,
+    COMMAND_BUFFER_COMPUTE = 1,
+    COMMAND_BUFFER_PULL_DATA = 2,
+    COMMAND_BUFFER_COUNT = 3
+};
+
 class HelloVK {
 public:
     void initVulkanCompute();
@@ -169,11 +176,11 @@ private:
     void createInstance();
     void setupDebugMessenger();
     void pickPhysicalDevice();
+    void getDeviceLimits();
     void createLogicalDeviceAndQueue();
     void createDescriptorSetLayout();
     void createCommandPool();
     void createCommandBuffer();
-    void createSyncObjects();
     static QueueFamilyIndices findQueueFamilies(VkPhysicalDevice device);
     bool checkDeviceExtensionSupport(VkPhysicalDevice device);
     bool isDeviceSuitable(VkPhysicalDevice device);
@@ -185,7 +192,7 @@ private:
     void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
                       VkMemoryPropertyFlags properties, VkBuffer &buffer,
                       VkDeviceMemory &bufferMemory);
-    void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size);
+    void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkCommandBuffer commandBuffer, VkDeviceSize size);
     void createStorageBuffers();
     void createUniformBuffers();
     void createComputePipeline();
@@ -218,8 +225,7 @@ private:
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
     VkDevice device;
     VkCommandPool commandPool;
-    VkCommandBuffer commandBuffer;
-    std::vector<VkCommandBuffer> commandBuffers;
+    std::vector<VkCommandBuffer> commandBuffers { COMMAND_BUFFER_COUNT };
 
     uint32_t queueFamilyIndex;
     VkQueue computeQueue;
@@ -237,17 +243,20 @@ private:
     VkDescriptorPool descriptorPool;
     std::vector<VkDescriptorSet> descriptorSets;
     VkDescriptorSet descriptorSet;
-    VkFence computeFence;
 
-    int32_t *sortData;
-    int32_t sortDataOriginal[BUFFER_LENGTH];
     uint32_t workGroupSize;
+    size_t minUboAlignment;
+    size_t actualUboAlignment;
+
+    //debug
+    uint32_t runCount = 0;
 };
 
 
 void HelloVK::initVulkanCompute() {
     createInstance();
     pickPhysicalDevice();
+    getDeviceLimits();
     createLogicalDeviceAndQueue();
     setupDebugMessenger();
     createDescriptorSetLayout();
@@ -258,7 +267,6 @@ void HelloVK::initVulkanCompute() {
     createComputePipeline();
     createCommandPool();
     createCommandBuffer();
-    createSyncObjects();
     initialized = true;
 }
 
@@ -322,7 +330,7 @@ uint32_t HelloVK::findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags prop
     return memoryTypeIndex;
 }
 
-void HelloVK::copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size) {
+void HelloVK::copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkCommandBuffer commandBuffer, VkDeviceSize size) {
     VkCommandBufferBeginInfo beginInfo {
             VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
             nullptr,
@@ -349,9 +357,6 @@ void HelloVK::copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize si
     };
 
     vkQueueSubmit(computeQueue, 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(computeQueue);
-
-    vkResetCommandBuffer(commandBuffer, 0);
 }
 
 void HelloVK::createStorageBuffers() {
@@ -364,14 +369,33 @@ void HelloVK::createStorageBuffers() {
 }
 
 void HelloVK::createUniformBuffers() {
-    VkDeviceSize bufferSize = sizeof(Parameters);
+    size_t n = BUFFER_LENGTH;
+
+    uint32_t max_workgroup_size = workGroupSize;
+    uint32_t workgroup_size_x;
+
+// Adjust workgroup_size_x to get as close to max_workgroup_size as possible.
+    if ( n < max_workgroup_size * 2 ) {
+        workgroup_size_x = n / 2;
+    } else {
+        workgroup_size_x = max_workgroup_size;
+    }
+
+    uint32_t outerRunCount = [](uint32_t n) { uint32_t ret = 0; while (n > 1) { n >>= 1; ret++; } return ret;} (BUFFER_LENGTH / workgroup_size_x);
+    uint32_t totalRunCount = outerRunCount * (outerRunCount + 1) / 2;
+    size_t alignment = sizeof(Parameters);
+    if (minUboAlignment > 0) {
+        alignment = (alignment + minUboAlignment - 1) & ~(minUboAlignment - 1);
+    }
+    actualUboAlignment = alignment;
+    VkDeviceSize bufferSize = actualUboAlignment * totalRunCount;
+
     uniformBuffers.resize(1);
     uniformBuffersMemory.resize(1);
     uniformBuffersMapped.resize(1);
 
     createBuffer(bufferSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
                  uniformBuffers[0], uniformBuffersMemory[0]);
     vkMapMemory(device, uniformBuffersMemory[0], 0, bufferSize, 0, &uniformBuffersMapped[0]);
 }
@@ -387,7 +411,7 @@ void HelloVK::createDescriptorSetLayout() {
             },
             {
                     1,
-                    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
                     1,
                     VK_SHADER_STAGE_COMPUTE_BIT,
                     nullptr
@@ -421,11 +445,10 @@ void HelloVK::initSortData() {
     std::default_random_engine engine(std::chrono::system_clock::now().time_since_epoch().count());
     for (uint32_t k = 0; k < BUFFER_LENGTH; k++) {
         data[k] = static_cast<int32_t>(uniform_dist(engine));
-        sortDataOriginal[k] = data[k];
     }
     vkUnmapMemory(device, stagingBufferMemory);
 
-    copyBuffer(stagingBuffer, storageBuffers[0], BUFFER_SIZE);
+    copyBuffer(stagingBuffer, storageBuffers[0], commandBuffers[COMMAND_BUFFER_PUSH_DATA], BUFFER_SIZE);
 
     vkDestroyBuffer(device, stagingBuffer, nullptr);
     vkFreeMemory(device, stagingBufferMemory, nullptr);
@@ -435,12 +458,13 @@ void HelloVK::checkDataSorted() {
     // Create a staging buffer used to download data from the gpu
     VkBuffer stagingBuffer;
     VkDeviceMemory stagingBufferMemory;
-    createBuffer(BUFFER_SIZE, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingBufferMemory);
+    createBuffer(BUFFER_SIZE, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingBufferMemory);
 
     int32_t* data;
     vkMapMemory(device, stagingBufferMemory, 0, BUFFER_SIZE, 0, reinterpret_cast<void **>(&data));
 
-    copyBuffer(storageBuffers[0], stagingBuffer, BUFFER_SIZE);
+    copyBuffer(storageBuffers[0], stagingBuffer, commandBuffers[COMMAND_BUFFER_PULL_DATA], BUFFER_SIZE);
+    vkQueueWaitIdle(computeQueue);
     bool error = false;
     for (uint32_t k = 0; k < BUFFER_LENGTH - 1; k++) {
         if (data[k + 1] > data[k]) {
@@ -458,19 +482,11 @@ void HelloVK::checkDataSorted() {
 }
 
 void HelloVK::dispatch(uint32_t workgroupCount) {
-    vkResetFences(device, 1, &computeFence);
-
-    VkCommandBufferBeginInfo commandBufferBeginInfo = {
-            VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-            nullptr,
-            VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-            nullptr
-    };
-    VK_CHECK(vkBeginCommandBuffer(commandBuffer, &commandBufferBeginInfo));
-    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
-    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
-    vkCmdDispatch(commandBuffer, workgroupCount, 1, 1);
+    uint32_t dynamicOffset = actualUboAlignment * runCount;
+    runCount++;
+    vkCmdBindDescriptorSets(commandBuffers[COMMAND_BUFFER_COMPUTE], VK_PIPELINE_BIND_POINT_COMPUTE,
+                            pipelineLayout, 0, 1, &descriptorSet, 1, &dynamicOffset);
+    vkCmdDispatch(commandBuffers[COMMAND_BUFFER_COMPUTE], workgroupCount, 1, 1);
     VkBufferMemoryBarrier memoryBufferBarrier {
             VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
             nullptr,
@@ -483,61 +499,54 @@ void HelloVK::dispatch(uint32_t workgroupCount) {
             VK_WHOLE_SIZE
     };
     vkCmdPipelineBarrier(
-            commandBuffer,
+            commandBuffers[COMMAND_BUFFER_COMPUTE],
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             0,
             0, nullptr,
             1, &memoryBufferBarrier,
             0, nullptr);
-    VK_CHECK(vkEndCommandBuffer(commandBuffer));
-
-    VkSubmitInfo submitInfo = {
-            VK_STRUCTURE_TYPE_SUBMIT_INFO,
-            nullptr,
-            0,
-            nullptr,
-            nullptr,
-            1,
-            &commandBuffer,
-            0,
-            nullptr
-    };
-    VK_CHECK(vkQueueSubmit(computeQueue, 1, &submitInfo, computeFence));
-    vkWaitForFences(device, 1, &computeFence, VK_TRUE, UINT64_MAX);
-
-    vkResetCommandBuffer(commandBuffer, 0);
-};
+}
 
 void HelloVK::localBitonicMergeSort(uint32_t h, uint32_t workgroupCount) {
     updateUniformBuffer(Parameters::eAlgorithmVariant::eLocalBitonicMergeSort, h);
     dispatch(workgroupCount);
-};
+}
 
 void HelloVK::bigFlip(uint32_t h, uint32_t workgroupCount) {
     updateUniformBuffer(Parameters::eAlgorithmVariant::eBigFlip, h);
     dispatch(workgroupCount);
-};
+}
 
 void HelloVK::localDisperse(uint32_t h, uint32_t workgroupCount) {
     updateUniformBuffer(Parameters::eAlgorithmVariant::eLocalDisperse, h);
     dispatch(workgroupCount);
-};
+}
 
 void HelloVK::bigDisperse(uint32_t h, uint32_t workgroupCount) {
     updateUniformBuffer(Parameters::eAlgorithmVariant::eBigDisperse, h);
     dispatch(workgroupCount);
-};
+}
 
 // layout(local_size_x_id = 1) in;
 #define LOCAL_SIZE_X_CONST_ID     1
 
 void HelloVK::compute() {
     initSortData();
+    VkCommandBuffer commandBuffer = commandBuffers[COMMAND_BUFFER_COMPUTE];
+    VkCommandBufferBeginInfo commandBufferBeginInfo = {
+            VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            nullptr,
+            VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            nullptr
+    };
+    VK_CHECK(vkBeginCommandBuffer(commandBuffer, &commandBufferBeginInfo));
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
+
     size_t n = BUFFER_LENGTH;
 
     uint32_t max_workgroup_size = workGroupSize;
-    uint32_t workgroup_size_x = 1;
+    uint32_t workgroup_size_x;
 
 // Adjust workgroup_size_x to get as close to max_workgroup_size as possible.
     if ( n < max_workgroup_size * 2 ) {
@@ -571,6 +580,18 @@ void HelloVK::compute() {
             }
         }
     }
+    VK_CHECK(vkEndCommandBuffer(commandBuffer));
+    VkSubmitInfo submitInfo {
+            VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            nullptr,
+            0,
+            nullptr,
+            nullptr,
+            1,
+            &commandBuffer
+    };
+
+    vkQueueSubmit(computeQueue, 1, &submitInfo, VK_NULL_HANDLE);
     checkDataSorted();
 }
 
@@ -581,7 +602,7 @@ void HelloVK::createDescriptorPool() {
                     1
             },
             {
-                    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
                     1
             }
     };
@@ -618,7 +639,7 @@ void HelloVK::createDescriptorSets() {
     VkDescriptorBufferInfo uniformBufferInfo{
             uniformBuffers[0],
             0,
-            sizeof(Parameters)
+            actualUboAlignment
     };
 
     VkWriteDescriptorSet writeDescriptorSet[2] = {
@@ -641,7 +662,7 @@ void HelloVK::createDescriptorSets() {
                     1,
                     0,
                     1,
-                    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
                     nullptr,
                     &uniformBufferInfo,
                     nullptr
@@ -663,8 +684,6 @@ void HelloVK::cleanupCompute() {
 
     vkDestroyBuffer(device, storageBuffers[0], nullptr);
     vkFreeMemory(device, storageBuffersMemory[0], nullptr);
-
-    vkDestroyFence(device, computeFence, nullptr);
 
     vkDestroyCommandPool(device, commandPool, nullptr);
     vkDestroyPipeline(device, computePipeline, nullptr);
@@ -841,6 +860,13 @@ void HelloVK::pickPhysicalDevice() {
 }
 // END DEVICE SUITABILITY
 
+void HelloVK::getDeviceLimits() {
+    VkPhysicalDeviceProperties properties;
+    vkGetPhysicalDeviceProperties(physicalDevice, &properties);
+    workGroupSize = std::min(properties.limits.maxComputeWorkGroupSize[0], properties.limits.maxComputeSharedMemorySize / 2);
+    minUboAlignment = properties.limits.minUniformBufferOffsetAlignment;
+}
+
 void HelloVK::createLogicalDeviceAndQueue() {
     QueueFamilyIndices indices = findQueueFamilies(physicalDevice);
     const float queuePrioritory = 1.0f;
@@ -873,11 +899,6 @@ void HelloVK::createLogicalDeviceAndQueue() {
 }
 
 void HelloVK::createComputePipeline() {
-    VkPhysicalDeviceProperties properties;
-    vkGetPhysicalDeviceProperties(physicalDevice, &properties);
-
-    workGroupSize = std::min(properties.limits.maxComputeWorkGroupSize[0], properties.limits.maxComputeSharedMemorySize / 2);
-
     VkSpecializationMapEntry specializationMapEntry {
             LOCAL_SIZE_X_CONST_ID,
             0,
@@ -932,7 +953,15 @@ void HelloVK::updateUniformBuffer(Parameters::eAlgorithmVariant algorithm, uint3
             h,
             algorithm
     };
-    memcpy(uniformBuffersMapped[0], &parameters, sizeof(parameters));
+    memcpy((uint8_t*)uniformBuffersMapped[0] + actualUboAlignment * runCount, &parameters, sizeof(Parameters));
+    VkMappedMemoryRange mappedMemoryRange {
+        VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+        nullptr,
+        uniformBuffersMemory[0],
+        actualUboAlignment * runCount,
+        actualUboAlignment
+    };
+    vkFlushMappedMemoryRanges(device, 1, &mappedMemoryRange);
 }
 
 VkShaderModule HelloVK::createShaderModule(const std::vector<uint8_t> &code) {
@@ -954,7 +983,7 @@ void HelloVK::createCommandPool() {
     VkCommandPoolCreateInfo commandPoolCreateInfo = {
             VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
             nullptr,
-            VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+            0,
             queueFamilyIndex
     };
     VK_CHECK(vkCreateCommandPool(device, &commandPoolCreateInfo, nullptr, &commandPool));
@@ -966,19 +995,10 @@ void HelloVK::createCommandBuffer() {
             nullptr,
             commandPool,
             VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-            1
+            static_cast<uint32_t>(commandBuffers.size())
     };
 
-    VK_CHECK(vkAllocateCommandBuffers(device, &commandBufferAllocateInfo, &commandBuffer));
-}
-
-void HelloVK::createSyncObjects() {
-    VkFenceCreateInfo fenceInfo{
-            VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-            nullptr,
-            VK_FENCE_CREATE_SIGNALED_BIT
-    };
-    vkCreateFence(device, &fenceInfo, nullptr, &computeFence);
+    VK_CHECK(vkAllocateCommandBuffers(device, &commandBufferAllocateInfo, commandBuffers.data()));
 }
 
 }  // namespace vkt
