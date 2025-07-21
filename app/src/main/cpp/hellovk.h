@@ -152,7 +152,7 @@ static void DestroyDebugUtilsMessengerEXT(
     }
 }
 
-#define BUFFER_LENGTH (128 * 1024)
+#define BUFFER_LENGTH (512 * 1024)
 #define BUFFER_SIZE (BUFFER_LENGTH * sizeof(int32_t))
 
 enum {
@@ -372,14 +372,8 @@ void HelloVK::createUniformBuffers() {
     size_t n = BUFFER_LENGTH;
 
     uint32_t max_workgroup_size = workGroupSize;
-    uint32_t workgroup_size_x;
-
-// Adjust workgroup_size_x to get as close to max_workgroup_size as possible.
-    if ( n < max_workgroup_size * 2 ) {
-        workgroup_size_x = n / 2;
-    } else {
-        workgroup_size_x = max_workgroup_size;
-    }
+    // Adjust workgroup_size_x to get as close to max_workgroup_size as possible.
+    uint32_t workgroup_size_x = (n < max_workgroup_size * 2) ? (n / 2) : max_workgroup_size;
 
     uint32_t outerRunCount = [](uint32_t n) { uint32_t ret = 0; while (n > 1) { n >>= 1; ret++; } return ret;} (BUFFER_LENGTH / workgroup_size_x);
     uint32_t totalRunCount = outerRunCount * (outerRunCount + 1) / 2;
@@ -546,14 +540,9 @@ void HelloVK::compute() {
     size_t n = BUFFER_LENGTH;
 
     uint32_t max_workgroup_size = workGroupSize;
-    uint32_t workgroup_size_x;
+    // Adjust workgroup_size_x to get as close to max_workgroup_size as possible.
+    uint32_t workgroup_size_x = (n < max_workgroup_size * 2) ? (n / 2) : max_workgroup_size;
 
-// Adjust workgroup_size_x to get as close to max_workgroup_size as possible.
-    if ( n < max_workgroup_size * 2 ) {
-        workgroup_size_x = n / 2;
-    } else {
-        workgroup_size_x = max_workgroup_size;
-    }
     const uint32_t workgroupCount = n / (workgroup_size_x * 2 );
 
     uint32_t h = workgroup_size_x * 2;
